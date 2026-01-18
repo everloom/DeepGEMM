@@ -7,14 +7,27 @@ from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_align
 
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # 这里使用了e4m3的fp8的对称量化，这里x的shape为4096*7168（m*k）
+    # 还有注意这里函数说是做的per token量化，但这里的per token量化和我直接理解的per token量化感觉不太一样
+    # 之前看论文里面讲的per token量化是，假设一个矩阵是num_tokens * hidden_size，那么per token量化就是对每个token的hidden_size这个vector做量化，hidden_size维度使用一个scale
+    # 但这里的per token量化明显不是这样的, 这里的fp8量化更加的细粒度。这里的per token量化是，这里的x的shape是4096*7168（我理解可以看作4096个token，每个token的hidden dim是7168）
+    # 然后将x view为4096*56*128，相当于每个token的vector变为了56份，每份是一个128的vector，fp8量化的时候则是128长度的vector单独使用一个scale
+    # 这样就相当于每个token实际包含了56个scale，整个x矩阵则包含了4096*56个scale
+    # 可以看到代码中return的结果，第一个结果是量化过后的x矩阵，shape被还原到了4096*7168，第二个结果是scale矩阵，shape是4096*56
     assert x.dim() == 2 and x.size(1) % 128 == 0
     m, n = x.shape
     x_view = x.view(m, -1, 128)
     x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+    # 这里448是e4m3的最大值，对应的二进制为01111110， 2^8 * 1.75=448
     return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), (x_amax / 448.0).view(m, -1)
 
 
 def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # 这里也是用的fp8对称量化，e4m3的格式，不过量化的方式很特殊，和我之前学过的都不一样
+    # 这里输入x的shape是2112x7168（n*k），在处理的时候会被padding到2176x7168（因为2112不能被128整除，所以会padding到2176）
+    # 代码中会将2176x7168的矩阵分为128x128个block（在代码中对应x_view，shape为17x128x56x128），总共有17x56个block
+    # 然后对每个block中的数据单独计算scale，并进行量化
+    # 最后的返回结果有两个，一个是经过量化后的x矩阵(shape为2112x7168)，另一个是scale矩阵(shape为17x56)
     assert x.dim() == 2
     m, n = x.shape
     x_padded = torch.zeros((ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device)
@@ -64,6 +77,7 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) 
 
 def test_gemm() -> None:
     print('Testing GEMM:')
+    # 后面的讲解就以m=4096, k=7168, n=2112为例
     for m in (64, 128, 4096):
         for k, n in [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096), (2048, 7168)]:
             x_fp8, y_fp8, out, ref_out = construct(m, k, n)
@@ -148,14 +162,16 @@ def test_m_grouped_gemm_masked() -> None:
 
 
 if __name__ == '__main__':
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.manual_seed(0)
-    random.seed(0)
+    # torch.backends.cuda.matmul.allow_tf32 = True
+    # torch.backends.cudnn.allow_tf32 = True
+    # torch.manual_seed(0)
+    # random.seed(0)
 
-    print('Library path:')
-    print(f' > {deep_gemm.__path__}\n')
+    # print('Library path:')
+    # print(f' > {deep_gemm.__path__}\n')
 
-    test_gemm()
-    test_m_grouped_gemm_contiguous()
-    test_m_grouped_gemm_masked()
+    # test_gemm()
+    # test_m_grouped_gemm_contiguous()
+    # test_m_grouped_gemm_masked()
+    
+    construct(4096, 7168, 2112)
