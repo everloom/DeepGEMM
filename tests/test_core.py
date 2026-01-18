@@ -4,6 +4,10 @@ from typing import Tuple
 
 import deep_gemm
 from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor
+# import sys
+# sys.path.append('/home/p/Workspace/code/cuda_learn/DeepGEMM')
+# from deep_gemm.utils import bench_kineto, calc_diff
+# from deep_gemm.jit_kernels.utils import ceil_div, get_col_major_tma_aligned_tensor
 
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -47,6 +51,10 @@ def construct(m: int, k: int, n: int) -> \
 
     x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_block_cast_to_fp8(y)
     # Transpose earlier so that the testing will not trigger transposing kernels
+    # 说一下这里调用get_col_major_tma_aligned_tensor的作用，主要作用就是将x_fp8[1]从行主序改为列主序
+    # x_fp8[1]的shape为4096*56，stride原本为(56, 1)，这表示行主序
+    # 在执行了这个函数之后，shape仍然为4096*56，但stride变成了(1, 4096)，这表示列主序
+    # 这个函数还有一个作用就是保证tma的16byte对齐要求，这个我还没深入研究，这个后面有时间了再说
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     return x_fp8, y_fp8, out, ref_out
 
@@ -162,16 +170,16 @@ def test_m_grouped_gemm_masked() -> None:
 
 
 if __name__ == '__main__':
-    # torch.backends.cuda.matmul.allow_tf32 = True
-    # torch.backends.cudnn.allow_tf32 = True
-    # torch.manual_seed(0)
-    # random.seed(0)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.manual_seed(0)
+    random.seed(0)
 
-    # print('Library path:')
-    # print(f' > {deep_gemm.__path__}\n')
+    print('Library path:')
+    print(f' > {deep_gemm.__path__}\n')
 
-    # test_gemm()
-    # test_m_grouped_gemm_contiguous()
-    # test_m_grouped_gemm_masked()
+    test_gemm()
+    test_m_grouped_gemm_contiguous()
+    test_m_grouped_gemm_masked()
     
-    construct(4096, 7168, 2112)
+    # construct(4096, 7168, 2112)

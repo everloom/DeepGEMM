@@ -57,6 +57,7 @@ def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: 
 
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                      is_grouped_contiguous: bool = False) -> Tuple[int, int, int, int, int, int]:
+    #计算block_ms， 因为此例子中m=4096, 因此block_ms=128
     if not is_grouped_contiguous:
         # TODO: for some cases, smaller M block is better, add them into tuning space
         block_ms = (64 if m <= 64 else 128, )
@@ -64,10 +65,27 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         block_ms = (get_m_alignment_for_contiguous_layout(), )
     block_ns = tuple(range(16, 129, 8)) + (160, )
 
+    """
+    说一下我自己对这里算block_ns的理解，，block_ms和block_ns就是C矩阵中block tile的大小
+    block_ms在非grouped_contiguous情况下固定为128。下面的代码是计算最优block_ns大小的代码
+    计算block_ns的规则是这样的，首先h100有132个block，而block_ns的大小会影响最终block的数量
+    代码中会对block_ns从16遍历到128，判断哪个block_ns的配置最优，最优的条件如下(也可以参考这个链接https://zhuanlan.zhihu.com/p/32383172703)：
+    1、round(block_num / 132)的数量最少，在代码中将这个值称为wave
+    2、在不同的block_ns情况的条件1的wave结果相同时，则根据block_num / 132的余数较大的情况选择block_ns的值
+    然后说一下我对为什么要设置条件1和条件2的理解（这里的理解可能需要我把整个代码都看完了才能来写了，to be continued）
+    还有关于num stage如何设置，以及代码中涉及到tma multicast相关的内容，需要等到我把代码完全看一遍了才能来写这里的理解了
+    """
+    #wave 理解为需要处理多少轮次， h800有132个streaming multi-processor, 
+    #不同的block_ns意味者C矩阵子块个数不同，因此需要的轮次也就会不同
+    #get_last_wave_util 则是在最后一轮中剩余的待处理子块，理论上c子块划分个数能整除132是最好的
+    #如果不能整除，则在轮次一致的情况下，最后一轮待处理子块个数越多越好，因为此时计算可以分散在尽可能多的sm硬件资源上
     fix_wave_saturate = lambda x: num_sms if x == 0 else x
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
     get_last_wave_util = lambda bm, bn: fix_wave_saturate((ceil_div(m, bm) * ceil_div(n, bn) * num_groups) % num_sms)
 
+    # block_ns取值从16到128，步长8增长
+    # 判断条件为轮次（get_num_waves）最少，在轮次一致的情况下，最后一轮待处理子块个数（get_last_wave_util）越多越好
+    # 在本例中 block_ns=128
     # Decide block sizes by waves
     best_block_m, best_block_n = None, None
     for block_m in block_ms:
@@ -86,6 +104,8 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
             best_block_m, best_block_n = (block_m, block_n) if success else (best_block_m, best_block_n)
     assert best_block_m is not None and best_block_n is not None
 
+    # 计算合适的stage, stage的判断条件为共享存储不超过232448的情况stage尽可能多
+    # 因为stage越多，占用的共享存储越多
     # Always pick the longest one
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_size, sm90_capacity = None, None, 232448
@@ -128,6 +148,18 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         rhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[n, k]`.
              the second element is an FP32 128x128 scaling tensor for RHS of shape `[⌈n / 128⌉, ⌈k / 128⌉]`.
         out: the BF16 output tensor of shape `[m, n]`, representing the result.
+
+    执行一个标准的 GEMM 运算，输入为 FP8 格式，输出为 BF16 格式，使用 1x128 的 LHS 缩放和 128x128 的 RHS 缩放。
+    LHS（左侧矩阵）、RHS（右侧矩阵）、RHS 缩放因子和输出张量必须是连续内存格式。
+    RHS 和 RHS缩放因子 需要被转置。（在construct里面构造RHS和对应缩放因子的时候就是n*k的转置形式了，都是行主序的）
+    LHS缩放张量 需要 TMA 对齐的转置格式，如果你的输入不满足这个要求，该函数会使用一组较慢的 PyTorch 操作来进行转置。
+
+    参数：
+        lhs：第一个元素是形状为 [m, k] 的 FP8 张量（类型为 torch.float8_e4m3fn），
+            第二个元素是形状为 [m, ceil(k / 128)] 的 FP32 1x128 缩放张量，用于 LHS。
+        rhs：第一个元素是形状为 [n, k] 的 FP8 张量（类型为 torch.float8_e4m3fn）。
+            第二个元素是形状为 [ceil(n / 128), ceil(k / 128)] 的 FP32 128x128 缩放张量，用于 RHS。
+        out：形状为 [m, n] 的 BF16 输出张量，表示计算结果。
     """
     lhs, lhs_scales = lhs
     rhs, rhs_scales = rhs
@@ -158,6 +190,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
 
     # Auto-tuning with compilation
     global includes, template
+    # 这里返回gpu的sm个数
     num_sms = get_num_sms()
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)

@@ -51,6 +51,12 @@ def get_m_alignment_for_contiguous_layout():
     
     Returns:
         Group-level alignment requirement for grouped contiguous layout, which is always 128.
+
+    当我们以连续格式执行分组 GEMM 时，LHS 沿 M 轴被分组为多个批次。
+    由于我们为每个 GEMM 块精确处理 RHS 的一个子矩阵，因此上述批次大小应该与 GEMM 块形状良好对齐。
+
+    返回：
+        分组连续布局的组级对齐要求，始终为 128。
     """
     return 128
 
