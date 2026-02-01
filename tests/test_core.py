@@ -11,6 +11,8 @@ from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_align
 
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # 我觉得这里应该是使用的group量化，以128为单位的group量化
+    
     # 这里使用了e4m3的fp8的对称量化，这里x的shape为4096*7168（m*k）
     # 还有注意这里函数说是做的per token量化，但这里的per token量化和我直接理解的per token量化感觉不太一样
     # 之前看论文里面讲的per token量化是，假设一个矩阵是num_tokens * hidden_size，那么per token量化就是对每个token的hidden_size这个vector做量化，hidden_size维度使用一个scale
