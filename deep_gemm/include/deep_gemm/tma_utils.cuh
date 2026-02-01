@@ -58,6 +58,7 @@ PFN_cuTensorMapEncodeTiled get_cuTensorMapEncodeTiled() {
     return reinterpret_cast<PFN_cuTensorMapEncodeTiled>(cuTensorMapEncodeTiled_ptr);
 }
 
+// 这个方法的作用是，通过cuTensorMapEncodeTiled初始化TMA需要的CUtensorMap对象
 template <typename T>
 CUtensorMap make_2d_tma_copy_desc(T* global_address, uint64_t gmem_dim[2],
                                   uint64_t stride_in_bytes, uint32_t smem_dim[2],
