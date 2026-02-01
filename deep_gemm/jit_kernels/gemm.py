@@ -4,6 +4,12 @@ from typing import Tuple
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
 
+"""
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+注意注意，这里负责创建tma的需要用到的TMA Descriptor
+TMA Descriptor需要在cpu host端创建, 在 Host 端指定 Global Memory 的维度、Shape以及首地址、Shared Memory 的 维度、Shape 初始化 CUtensorMap 结构
+"""
 # C++ code templates
 includes = ('"deep_gemm/fp8_gemm.cuh"', )
 template = """
@@ -20,6 +26,8 @@ constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
 using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, GemmType::Normal>;
 
 // Launch kernel
+// 这里调用了静态模版类方法，但没有传模版参数，因为编译器可以自动推导出此时的模版参数是什么
+// 关于tensor map的注释，我写在了include/deep_gemm/fp8_gemm.cuh的make_2d_tma_a_desc方法上面
 auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs, m);
 auto tma_b_desc = GemmType::make_2d_tma_b_desc(rhs);
 auto tma_scales_a_desc = GemmType::make_2d_tma_scales_a_desc(lhs_scales, m);
@@ -38,11 +46,19 @@ def is_tma_multicast_legal(n: int, block_n: int, num_tma_multicast: int, num_sms
 
 
 def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128) -> int:
+    # 输出矩阵 (C/D) 累加器, 由于是bf16类型的，所以乘以2
     smem_d = block_m * block_n * 2
+    # lhs矩阵的smem，由于是fp8类型的所以乘以1
     smem_a_per_stage = block_m * block_k
+    # lhs scale矩阵的smem，由于是fp32类型的，所以乘以4
     smem_scales_a_per_stage = block_m * 4
+    # rhs矩阵的smem，由于是fp8类型的所以乘以1
     smem_b_per_stage = block_n * block_k
+    # rhs scale矩阵的smem，由于是fp32类型的，所以乘以4
+    # 这里k为7168，block_k为128，smem_scales_b = ceil_div(7168, 128) * 4 = 56 * 4
     smem_scales_b = ceil_div(k, block_k) * 4
+    # gemini 3pro说这个是用于mbarrier的smem，我没怎么研究，有空可以根据这个来研究一下https://zhuanlan.zhihu.com/p/1962636004235153810
+    # 这里乘2是因为有两个barrier，full_barriers和empty_barriers
     smem_barrier = num_stages * 8 * 2
 
     smem_size = 0
@@ -50,6 +66,10 @@ def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: 
     smem_size += num_stages * smem_a_per_stage
     smem_size += num_stages * smem_scales_a_per_stage
     smem_size += num_stages * smem_b_per_stage
+    # 这里smem_scales_b可以看到会根据block_k能否整除block_n来判断smem_scales_b乘以系数1还是2
+    # 由于rhs的在n维度的量化粒度是128，当实际的BLOCK_N大于128时，会出现跨越两个block的情况，此时就需要载入两个scale
+    # 这里block_k % block_n表示block_k是否能整除block_n，block_k固定为128大小，刚好和n的128量化粒度吻合
+    # 在本例中，block_n为160，block_k % block_n 不为0，所以smem_scales_b会乘以2的系数
     smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
     smem_size += smem_barrier
     return smem_size
@@ -66,14 +86,16 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     block_ns = tuple(range(16, 129, 8)) + (160, )
 
     """
-    说一下我自己对这里算block_ns的理解，，block_ms和block_ns就是C矩阵中block tile的大小
+    说一下我自己对这里算block_ns的理解，block_ms和block_ns就是C矩阵中block tile的大小
     block_ms在非grouped_contiguous情况下固定为128。下面的代码是计算最优block_ns大小的代码
     计算block_ns的规则是这样的，首先h100有132个block，而block_ns的大小会影响最终block的数量
-    代码中会对block_ns从16遍历到128，判断哪个block_ns的配置最优，最优的条件如下(也可以参考这个链接https://zhuanlan.zhihu.com/p/32383172703)：
+    代码中会对block_ns从16遍历到128，判断哪个block_ns的配置最优，最优的条件如下(可以参考这个链接https://zhuanlan.zhihu.com/p/32383172703)：
     1、round(block_num / 132)的数量最少，在代码中将这个值称为wave
     2、在不同的block_ns情况的条件1的wave结果相同时，则根据block_num / 132的余数较大的情况选择block_ns的值
     然后说一下我对为什么要设置条件1和条件2的理解（这里的理解可能需要我把整个代码都看完了才能来写了，to be continued）
-    还有关于num stage如何设置，以及代码中涉及到tma multicast相关的内容，需要等到我把代码完全看一遍了才能来写这里的理解了
+    还有关于num_stage为什么越大越好，这个也有待研究
+    
+    在本例的情况下（m=4096, n=2112, k=7168），得到的block_ns = 160, num_stage = 5, smem_size = 228368
     """
     #wave 理解为需要处理多少轮次， h800有132个streaming multi-processor, 
     #不同的block_ns意味者C矩阵子块个数不同，因此需要的轮次也就会不同
@@ -106,22 +128,38 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     # 计算合适的stage, stage的判断条件为共享存储不超过232448的情况stage尽可能多
     # 因为stage越多，占用的共享存储越多
+    # 这里得到最优的best_num_stages的过程中，隐性写死了block_k=128
+    # 这里best_num_stages的选择标准是，在约束共享存储不超过232448（227k）的情况下，使用的smem越多越好，具体参考https://zhuanlan.zhihu.com/p/32383172703
     # Always pick the longest one
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_size, sm90_capacity = None, None, 232448
     for num_stages in (6, 5, 4) if 128 % best_block_n != 0 else (8, 7, 6, 5, 4):
+        # 这里best_smem_size是一个block总的smem大小
         best_smem_size = get_smem_size(num_stages, k, best_block_m, best_block_n)
         if best_smem_size <= sm90_capacity:
             best_num_stages = num_stages
             break
     assert best_num_stages is not None
 
+
+    """
+    关于TMA multicast，参考reed大佬的tma博客https://zhuanlan.zhihu.com/p/1985678344352731952，里面是这样说的
+    TMA还能提供Cluster内的Multicast能力，即读取一份数据可以组播给cluster内的多个block
+    """
     # Decide the number of TMA multicast
     best_num_tma_multicast = 1
+    # 当M大于1024(lhs的行数)且num_groups为1时将best_num_tma_multicast设置为2
+    # 按照当前的例子，测试普通的fp8 gemm，M是大于1024的且传入num_groups就是1
+    # 这里还有调用is_tma_multicast_legal对n等参数的检查，这个函数我没细看，咱不知道在干嘛
+    # 综上，在本例中best_num_tma_multicast的返回结果应该就是2
     # When using large block tiling, broadcasting B is required to achieve maximum performance gains.
     if m >= 1024 and is_tma_multicast_legal(n, best_block_n, 2, num_sms) and num_groups == 1:
         best_num_tma_multicast = 2
 
+    """
+    下面这块的代码，看了下在早期的commit中是没有的，应该是后面又添加了这块的优化
+    这里的优化细节我没时间研究了，有空再看看
+    """
     # Recompute the minimal number of SMs required
     # NOTES: less L2 cache usage and less GPU frequency drop
     num_waves = get_num_waves(best_block_m, best_block_n)
@@ -192,6 +230,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     global includes, template
     # 这里返回gpu的sm个数
     num_sms = get_num_sms()
+    # 在本例的情况下（m=4096, n=2112, k=7168），得到的block_ms = 128, block_ns = 160, num_stage = 5, smem_size = 228368
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
     # 注意，这里jit编译后进行调用的地方是fp8_geeemm.cuh中的Gemm::run方法，这个文件最上面的宏展开可以说明一切
@@ -200,6 +239,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
               'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast},
         space=(),
+        # lhs.shape 4096*7168, lhs_scales.shape 4096*56, rhs.shape 2112*7168, rhs_scales.shape 17*56
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
                   ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
