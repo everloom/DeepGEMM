@@ -30,7 +30,7 @@ struct Scheduler {
 
     __device__ __forceinline__ explicit Scheduler(const uint32_t shape_m,
                                                   int* grouped_layout = nullptr) {
-        num_aligned_m_blocks = ceil_div(shape_m, BLOCK_M);
+        num_aligned_m_blocks = ceil_div(shape_m, BLOCK_M); // 4096 / 128 = 32
         if constexpr (kGemmType == GemmType::Normal) {
             num_blocks = num_aligned_m_blocks * kNumNBlocks;
         } else if (kGemmType == GemmType::GroupedContiguous) {
@@ -44,14 +44,18 @@ struct Scheduler {
 
     __device__ __forceinline__ void get_swizzled_block_idx(const uint32_t num_m_blocks, int block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx) {
         DG_STATIC_ASSERT(kNumNBlocksPerGroup % kNumTMAMulticast == 0, "Invalid group size");
-
+        // kNumNBlocksPerGroup默认为16，num_m_blocks在本例中为32，num_blocks_per_group为512
         // Swizzle for better L2 usages
         auto num_blocks_per_group = num_m_blocks * kNumNBlocksPerGroup;
+        // group_idx决定是第几组
         auto group_idx = block_idx / num_blocks_per_group;
         auto first_n_block_idx = group_idx * kNumNBlocksPerGroup;
         auto num_n_blocks_in_group = min(kNumNBlocksPerGroup, kNumNBlocks - first_n_block_idx);
+        // in_group_idx 决定组内顺序
         auto in_group_idx = block_idx % num_blocks_per_group;
+        // m_block_id决定组内第几行, 从上到下
         m_block_idx = in_group_idx / num_n_blocks_in_group;
+        // n_block_id决定第几列， first_n_block_idx为该组的起始列， 从左到右
         n_block_idx = first_n_block_idx + in_group_idx % num_n_blocks_in_group;
     }
 
