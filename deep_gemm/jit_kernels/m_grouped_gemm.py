@@ -54,6 +54,25 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
             `m_indices[i]` records the group which the i-th row of the LHS belong to,
             which means that the i-th row of the LHS matrix will be multiplied with `rhs[m_indices[i]]`.
             Values of `m_indices` in every-m-alignment-block must also be the same.
+            
+    执行分组 GEMM（连续格式），使用 FP8 输入和 BF16 输出，以及 1x128 的 LHS 缩放和 128x128 的 RHS 缩放。
+    LHS、RHS、RHS 缩放因子以及输出张量必须是连续格式（contiguous format）。
+    RHS 和 RHS 缩放因子要求必须是转置过的。
+    LHS 缩放张量要求采用 TMA 对齐的转置格式，如果你的输入不符合该要求，
+        本函数将使用一组较慢的 PyTorch 操作进行转置。
+    在 M 轴上，输入被分为若干个批次（Batch），其批次大小与
+        `get_m_alignment_for_contiguous_layout()` (128) 对齐。
+
+    参数：
+        lhs: 第一个元素是形状为 `[m_sum, k]` 的 FP8 张量（类型为 `torch.float8_e4m3fn`），
+             第二个元素是形状为 `[m_sum, ⌈k / 128⌉]` 的 FP32 1x128 LHS 缩放张量。
+        rhs: 第一个元素是形状为 `[num_groups, n, k]` 的 FP8 张量（类型为 `torch.float8_e4m3fn`）。
+             第二个元素是形状为 `[num_groups, ⌈n / 128⌉, ⌈k / 128⌉]` 的 FP32 128x128 RHS 缩放张量。
+        out: 形状为 `[m_sum, n]` 的 BF16 输出张量，表示计算结果。
+        m_indices: 形状为 `[m_sum]` 且类型为 `torch.int` 的张量。
+            `m_indices[i]` 记录了 LHS 第 i 行所属的组，
+            这意味着 LHS 矩阵的第 i 行将与 `rhs[m_indices[i]]` 相乘。
+            在每个 m 对齐块（m-alignment-block）内，`m_indices` 的值必须相同。
     """
     lhs, lhs_scales = lhs
     rhs, rhs_scales = rhs
